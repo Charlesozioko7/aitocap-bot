@@ -10,11 +10,11 @@ import telebot
 from telebot import types
 
 # ===== CONFIG =====
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8324820648:AAFnnA65MrpHjymTol3vBRy4iwP8DFyGxx8"
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
-RENDER_URL = "https://YOUR_RENDER_URL_HERE/"
-ADMIN_IDS = [123456789]  # Replace with your Telegram ID(s)
+RENDER_URL = "https://aitocap-bot.onrender.com/"
+ADMIN_IDS = [7623720521]  # Replace with your Telegram ID(s)
 
 # ===== DATABASE SETUP =====
 conn = sqlite3.connect("trading_app.db", check_same_thread=False)
