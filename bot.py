@@ -7,7 +7,8 @@ import random
 import matplotlib.pyplot as plt
 from flask import Flask
 import telebot
-from telebot import types
+from flask import Flask,request
+import threading,time,sqlite3 
 
 # ===== CONFIG =====
 BOT_TOKEN = "8324820648:AAFnnA65MrpHjymTol3vBRy4iwP8DFyGxx8"
@@ -507,5 +508,31 @@ def finalize_order(message, pair, order_type, price):
     except:
         bot.send_message(user_id, "Invalid amount. Try again.")
 
-# ===== START BOT =====
-bot.infinity_polling()
+# ===== FLASK WEBHOOK SETUP =====
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def getMessage():
+    json_str = request.get_data().decode('UTF-8')
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "OK", 200
+
+@app.route('/')
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=RENDER_URL + BOT_TOKEN)
+    return "Webhook set successfully!", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# ===== STARTUP MODE =====
+if __name__ == "__main__":
+    import os
+
+    if os.getenv("LOCAL_MODE") == "1":
+        print("Running in LOCAL MODE (polling)...")
+        bot.remove_webhook()
+        bot.polling(none_stop=True)
+    else:
+        print("Running in RENDER MODE (webhook)...")
+        threading.Thread(target=run_flask).start()
