@@ -11,7 +11,7 @@ from telebot import types
 
 # ===== CONFIG =====
 BOT_TOKEN = "8324820648:AAFnnA65MrpHjymTol3vBRy4iwP8DFyGxx8"
-RENDER_URL = "https://your-render-app-url.onrender.com/"  # Replace with your Render URL
+RENDER_URL = "https://aitocap-bot.onrender.com/"  # Replace with your Render URL
 ADMIN_IDS = [7623720521]  # Your Telegram ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
