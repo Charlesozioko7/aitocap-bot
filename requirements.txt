@@ -1,4 +1,4 @@
 pyTelegramBotAPI==4.12.0
-flask
-requests
-matplotlib
+flask==2.3.5
+requests==2.32.0
+matplotlib==3.8.4
