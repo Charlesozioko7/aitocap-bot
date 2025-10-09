@@ -1,4 +1,4 @@
-flask==3.0.3
 pyTelegramBotAPI==4.12.0
-requests
-matplotlib
+Flask==2.3.3
+requests==2.32.3
+gunicorn==21.2.0
