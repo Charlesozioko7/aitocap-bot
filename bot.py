@@ -1,574 +1,527 @@
-# bot.py — Full-feature Telegram trading admin+user system
-# Features:
-# - User registration + mandatory KYC
-# - Deposit & withdrawal flows (Telegram) with optional proof upload
-# - Admin panel (Flask) with login (env vars), approve/reject, manual balance adjust
-# - Auto credit on deposit approval, auto debit on withdrawal approval (with insufficient balance check)
-# - Reject requires reason (web form)
-# - Multi-admin support and audit log (who performed action)
-# - KYC/proof file download
-# - Webhook-ready for Render (uses RENDER_EXTERNAL_URL)
-# - Data persisted to users.json and transactions.json
-
-import os
-import json
-import time
-import datetime
-from functools import wraps
-from flask import Flask, request, render_template_string, send_from_directory, redirect, url_for, session
 import telebot
-from telebot import types
+from flask import Flask
+from tinydb import TinyDB, Query
+import threading
+import time
 
-# ----------------- CONFIG -----------------
-TOKEN = "8324820648:AAFnnA65MrpHjymTol3vBRy4iwP8DFyGxx8"  # your bot token (already provided)
-# Admin username/password will be taken from environment variables (safer).
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "AitoCap@2025")
-# Admin Telegram IDs from environment (comma-separated) OR default to the one you gave.
-ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "8405874261")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_ENV.split(",") if x.strip()]
+# ---------------- CONFIG ----------------
+TOKEN = "8324820648:AAFnnA65MrpHjymTol3vBRy4iwP8DFyGxx8"  # your bot token
+ADMIN_ID = 7757657728  # your Telegram ID
+ADMIN_PASSWORD = "profitadmin"  # change if you want
 
-CURRENCY = os.environ.get("CURRENCY", "USD")  # default currency display
-DEPOSIT_METHODS = ["Bank Transfer", "Crypto (USDT)", "PayPal"]
-
-# Storage paths
-USERS_FILE = "users.json"
-TX_FILE = "transactions.json"
-UPLOAD_DIR = "kyc_uploads"
-
-# Ensure directories and files exist
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-if not os.path.exists(USERS_FILE):
-    with open(USERS_FILE, "w") as f:
-        json.dump({}, f)
-if not os.path.exists(TX_FILE):
-    with open(TX_FILE, "w") as f:
-        json.dump([], f)
-
-# ----------------- FLASK & TELEGRAM -----------------
-app = Flask(__name__)
-# session secret — for production set a stable secret via env var
-app.secret_key = os.environ.get("FLASK_SECRET") or os.urandom(24)
+# Wallets (as you provided)
+WALLETS = {
+    "BTC": "bc1qfkf8ntrr74mze6sg6qk3eunhd9lstyzs3xt640",
+    "USDT-TRC20": "TLZuKgWPXczMNSdkxgDxbmjuqu1kbgExTg",
+    "ETH": "0x17CfFAbFF7FDCc9a70e6E640C8cF8730a17840b2",
+    "TRX": "TLZuKgWPXczMNSdkxgDxbmjuqu1kbgExTg",
+    "BNB": "0x17CfFAbFF7FDCc9a70e6E640C8cF8730a17840b2"
+}
 
 bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
-# ----------------- UTIL HELPERS -----------------
-def now_str():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+# ---------------- DB ----------------
+db = TinyDB('data.json')
+users_table = db.table('users')          # documents: {id: <int>, balance: <float>}
+deposits_table = db.table('deposits')    # documents: {id: <int autogen>, user_id, coin, amount, txid, status, created_at}
+withdrawals_table = db.table('withdrawals')  # documents: {id, user_id, coin, amount, wallet, status, created_at}
+meta = db.table('meta')                  # for counters / config
 
-def load_users():
-    with open(USERS_FILE, "r") as f:
-        return json.load(f)
+# helper for IDs
+def next_id(table_name):
+    key = f"__nextid_{table_name}"
+    rec = meta.get(Query().key == key)
+    if not rec:
+        meta.insert({'key': key, 'value': 1})
+        return 1
+    cur = rec['value']
+    meta.update({'value': cur + 1}, Query().key == key)
+    return cur
 
-def save_users(data):
-    with open(USERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ---------------- Helpers ----------------
+def get_user_record(user_id):
+    rec = users_table.get(Query().id == user_id)
+    if not rec:
+        users_table.insert({'id': user_id, 'balance': 0.0})
+        rec = users_table.get(Query().id == user_id)
+    return rec
 
-def load_txs():
-    with open(TX_FILE, "r") as f:
-        return json.load(f)
+def update_balance(user_id, new_balance):
+    if users_table.contains(Query().id == user_id):
+        users_table.update({'balance': new_balance}, Query().id == user_id)
+    else:
+        users_table.insert({'id': user_id, 'balance': new_balance})
 
-def save_txs(txs):
-    with open(TX_FILE, "w") as f:
-        json.dump(txs, f, indent=2)
+def list_users():
+    return users_table.all()
 
-def append_audit_entry(tx, admin_name, action, reason=""):
-    entry = {"admin": admin_name, "action": action, "reason": reason, "timestamp": now_str()}
-    tx.setdefault("audit", []).append(entry)
+def add_deposit_request(user_id, coin, amount, txid=""):
+    did = next_id('deposit')
+    deposits_table.insert({
+        'id': did,
+        'user_id': user_id,
+        'coin': coin,
+        'amount': float(amount),
+        'txid': txid,
+        'status': 'pending',
+        'created_at': time.time()
+    })
+    return did
 
-def send_admin_notify(text):
-    for aid in ADMIN_IDS:
-        try:
-            bot.send_message(aid, text)
-        except Exception as e:
-            print("Admin notify failed:", e)
+def add_withdraw_request(user_id, coin, amount, wallet):
+    wid = next_id('withdraw')
+    withdrawals_table.insert({
+        'id': wid,
+        'user_id': user_id,
+        'coin': coin,
+        'amount': float(amount),
+        'wallet': wallet,
+        'status': 'pending',
+        'created_at': time.time()
+    })
+    return wid
 
-def save_file_from_message(message, prefix):
-    """
-    Saves photo or document to UPLOAD_DIR.
-    Returns saved filename (basename) or None.
-    """
+def format_money(x):
     try:
-        if message.content_type == "photo":
-            file_id = message.photo[-1].file_id
-        elif message.content_type == "document":
-            file_id = message.document.file_id
-        else:
-            return None
-        finfo = bot.get_file(file_id)
-        data = bot.download_file(finfo.file_path)
-        base = finfo.file_path.split("/")[-1]
-        filename = f"{prefix}_{int(time.time())}_{base}"
-        path = os.path.join(UPLOAD_DIR, filename)
-        with open(path, "wb") as fp:
-            fp.write(data)
-        return filename
-    except Exception as e:
-        print("save_file_from_message error:", e)
-        return None
+        return f"${float(x):.2f}"
+    except:
+        return str(x)
 
-def add_transaction(user_id, tx_type, amount, method, proof_file=""):
-    txs = load_txs()
-    tx_id = (txs[-1]["id"] + 1) if txs else 1
-    tx = {
-        "id": tx_id,
-        "user_id": str(user_id),
-        "type": tx_type,
-        "amount": float(amount),
-        "method": method or "",
-        "proof_file": proof_file or "",
-        "status": "Pending",
-        "timestamp": now_str(),
-        "admin_comment": "",
-        "audit": []
-    }
-    txs.append(tx)
-    save_txs(txs)
-    return tx
-
-# ----------------- TELEGRAM HANDLERS: Registration & KYC -----------------
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    uid = str(message.from_user.id)
-    users = load_users()
-    if uid not in users:
-        users[uid] = {
-            "name": None,
-            "email": None,
-            "kyc_uploaded": False,
-            "kyc_file": "",
-            "balance": 0.0
-        }
-        save_users(users)
-        bot.send_message(message.chat.id, "Welcome! Please enter your full name:")
-        bot.register_next_step_handler(message, handle_name)
-    else:
-        bot.send_message(message.chat.id, "Welcome back! If you haven't uploaded KYC, please upload now (photo or PDF).")
-
-def handle_name(message):
-    uid = str(message.from_user.id)
-    name = message.text.strip()
-    users = load_users()
-    users[uid]["name"] = name
-    save_users(users)
-    bot.send_message(message.chat.id, "Thanks. Please enter your email address:")
-    bot.register_next_step_handler(message, handle_email)
-
-def handle_email(message):
-    uid = str(message.from_user.id)
-    email = message.text.strip()
-    users = load_users()
-    users[uid]["email"] = email
-    save_users(users)
-    bot.send_message(message.chat.id, f"Registration saved.\nNow upload your KYC document (photo or PDF). KYC is mandatory to use the platform.")
-    # user should upload file next
-
-@bot.message_handler(content_types=["photo", "document"])
-def handle_file(message):
-    uid = str(message.from_user.id)
-    users = load_users()
-    if uid not in users:
-        bot.send_message(message.chat.id, "Please send /start to register first.")
-        return
-    filename = save_file_from_message(message, prefix=uid)
-    if not filename:
-        bot.send_message(message.chat.id, "Could not process file — please send a photo or PDF.")
-        return
-    # If user has not uploaded KYC yet, mark as KYC; otherwise treat as generic proof
-    if not users[uid].get("kyc_uploaded", False):
-        users[uid]["kyc_uploaded"] = True
-        users[uid]["kyc_file"] = filename
-        save_users(users)
-        bot.send_message(message.chat.id, "✅ KYC received. Awaiting admin review.")
-        send_admin_notify(f"New KYC uploaded by {uid}. Visit /admin to review.")
-    else:
-        bot.send_message(message.chat.id, "File saved. If this is proof for a transaction, attach it when prompted in /deposit or /withdraw flow.")
-
-# ----------------- TELEGRAM: Deposit & Withdraw flows -----------------
-@bot.message_handler(commands=["deposit"])
-def cmd_deposit(message):
-    uid = str(message.from_user.id)
-    users = load_users()
-    if uid not in users:
-        bot.send_message(message.chat.id, "Please /start to register first.")
-        return
-    if not users[uid].get("kyc_uploaded", False):
-        bot.send_message(message.chat.id, "KYC required before deposits. Upload KYC first.")
-        return
-    # show deposit methods
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    for m in DEPOSIT_METHODS:
-        markup.add(m)
-    markup.add("Cancel")
-    bot.send_message(message.chat.id, f"Choose deposit method ({CURRENCY}):", reply_markup=markup)
-    bot.register_next_step_handler(message, deposit_choose_method)
-
-def deposit_choose_method(message):
-    uid = str(message.from_user.id)
-    method = message.text.strip()
-    if method == "Cancel":
-        bot.send_message(message.chat.id, "Deposit cancelled.", reply_markup=types.ReplyKeyboardRemove())
-        return
-    if method not in DEPOSIT_METHODS:
-        bot.send_message(message.chat.id, "Invalid method. Use /deposit to retry.")
-        return
-    bot.send_message(message.chat.id, "Enter deposit amount (numbers only):", reply_markup=types.ReplyKeyboardRemove())
-    bot.register_next_step_handler(message, lambda m: deposit_amount_step(m, method))
-
-def deposit_amount_step(message, method):
-    uid = str(message.from_user.id)
-    amt_text = message.text.strip()
-    if not amt_text.replace(".", "", 1).isdigit():
-        bot.send_message(message.chat.id, "Invalid amount. Try /deposit again.")
-        return
-    amount = float(amt_text)
-    # ask for optional proof
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add("Upload proof now", "Skip proof")
-    bot.send_message(message.chat.id, "Upload proof (screenshot/tx hash) now or Skip proof.", reply_markup=markup)
-    bot.register_next_step_handler(message, lambda m: deposit_proof_step(m, amount, method))
-
-def deposit_proof_step(message, amount, method):
-    uid = str(message.from_user.id)
-    if message.text == "Skip proof":
-        tx = add_transaction(uid, "Deposit", amount, method, proof_file="")
-        bot.send_message(message.chat.id, f"✅ Deposit request recorded (id {tx['id']}) — awaiting admin approval.")
-        send_admin_notify(f"New Deposit #{tx['id']} from {uid} — ${amount} {CURRENCY}. Admin: /admin")
-        return
-    # if file sent:
-    if message.content_type in ["photo", "document"]:
-        filename = save_file_from_message(message, prefix=f"{uid}_proof")
-        tx = add_transaction(uid, "Deposit", amount, method, proof_file=filename)
-        bot.send_message(message.chat.id, f"✅ Deposit request recorded (id {tx['id']}) with proof — awaiting admin approval.")
-        send_admin_notify(f"New Deposit #{tx['id']} from {uid} — ${amount} {CURRENCY} (proof attached). Admin: /admin")
-        return
-    # otherwise prompt
-    bot.send_message(message.chat.id, "Please upload a photo/pdf as proof or send 'Skip proof'.")
-    bot.register_next_step_handler(message, lambda m: deposit_proof_step(m, amount, method))
-
-@bot.message_handler(commands=["withdraw"])
-def cmd_withdraw(message):
-    uid = str(message.from_user.id)
-    users = load_users()
-    if uid not in users:
-        bot.send_message(message.chat.id, "Please /start to register first.")
-        return
-    if not users[uid].get("kyc_uploaded", False):
-        bot.send_message(message.chat.id, "KYC required before withdrawals. Upload KYC first.")
-        return
-    bot.send_message(message.chat.id, "Enter withdrawal amount (numbers only):")
-    bot.register_next_step_handler(message, withdraw_amount_step)
-
-def withdraw_amount_step(message):
-    uid = str(message.from_user.id)
-    amt_text = message.text.strip()
-    if not amt_text.replace(".", "", 1).isdigit():
-        bot.send_message(message.chat.id, "Invalid amount. Try /withdraw again.")
-        return
-    amount = float(amt_text)
-    bot.send_message(message.chat.id, "Enter destination (wallet address or bank details):")
-    bot.register_next_step_handler(message, lambda m: withdraw_dest_step(m, amount))
-
-def withdraw_dest_step(message, amount):
-    uid = str(message.from_user.id)
-    dest = message.text.strip()
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add("Upload proof now", "Skip proof")
-    bot.send_message(message.chat.id, "Upload proof now (optional) or Skip proof.", reply_markup=markup)
-    bot.register_next_step_handler(message, lambda m: withdraw_proof_step(m, amount, dest))
-
-def withdraw_proof_step(message, amount, dest):
-    uid = str(message.from_user.id)
-    if message.text == "Skip proof":
-        # simple 2FA: send code in chat (demo). For production, use more robust OTP.
-        otp = str(int(time.time()) % 1000000)
-        bot.send_message(message.chat.id, f"Your 2FA code: {otp}\nEnter the code to confirm withdrawal.")
-        bot.register_next_step_handler(message, lambda m: finalize_withdraw_otp(m, amount, dest, otp, proof_file=""))
-        return
-    if message.content_type in ["photo", "document"]:
-        filename = save_file_from_message(message, prefix=f"{uid}_proof")
-        otp = str(int(time.time()) % 1000000)
-        bot.send_message(message.chat.id, f"Your 2FA code: {otp}\nEnter the code to confirm withdrawal.")
-        bot.register_next_step_handler(message, lambda m: finalize_withdraw_otp(m, amount, dest, otp, proof_file=filename))
-        return
-    bot.send_message(message.chat.id, "Please upload file or 'Skip proof'.")
-    bot.register_next_step_handler(message, lambda m: withdraw_proof_step(m, amount, dest))
-
-def finalize_withdraw_otp(message, amount, dest, otp, proof_file=""):
-    uid = str(message.from_user.id)
-    code = message.text.strip()
-    if code != otp:
-        bot.send_message(message.chat.id, "Invalid 2FA code. Withdrawal cancelled.")
-        return
-    tx = add_transaction(uid, "Withdrawal", amount, dest, proof_file=proof_file)
-    bot.send_message(message.chat.id, f"✅ Withdrawal request recorded (id {tx['id']}) — awaiting admin approval.")
-    send_admin_notify(f"New Withdrawal #{tx['id']} from {uid} — ${amount} {CURRENCY}. Admin: /admin")
-
-# ----------------- FLASK: Admin auth utilities -----------------
-def login_required(f):
-    @wraps(f)
-    def wrapped(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return wrapped
-
-# ----------------- FLASK ROUTES: Admin panel -----------------
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        user = request.form.get("username", "")
-        pwd = request.form.get("password", "")
-        if user == os.environ.get("ADMIN_USERNAME", ADMIN_USERNAME) and pwd == os.environ.get("ADMIN_PASSWORD", ADMIN_PASSWORD):
-            session["logged_in"] = True
-            session["admin_user"] = user
-            return redirect(url_for("admin_panel"))
-        else:
-            return render_template_string("<h3>Invalid credentials</h3><a href='/login'>Back</a>")
-    return render_template_string("""
-        <h2>Admin Login</h2>
-        <form method="post">
-            <input name="username" placeholder="username" required><br><br>
-            <input name="password" placeholder="password" type="password" required><br><br>
-            <input type="submit" value="Login">
-        </form>
-    """)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-@app.route("/admin")
-@login_required
-def admin_panel():
-    users = load_users()
-    txs = load_txs()
-    txs_sorted = sorted(txs, key=lambda x: x["id"], reverse=True)
-    # simple admin HTML with actions
-    html = """
-    <html><head><title>Admin Panel</title>
-    <style>body{font-family:Arial;padding:16px} table{border-collapse:collapse;width:100%} th,td{padding:8px;border:1px solid #ddd} a{color:#06c}</style>
-    </head><body>
-    <h1>AitoCap Admin Panel</h1>
-    <p>Logged in as: {{admin_user}} | <a href="/logout">Logout</a></p>
-
-    <h2>Pending Transactions</h2>
-    <table>
-    <tr><th>ID</th><th>User</th><th>Type</th><th>Amount</th><th>Method/Dest</th><th>Proof</th><th>Time</th><th>Status</th><th>Actions</th></tr>
-    {% for tx in txs %}
-      <tr>
-        <td>{{tx['id']}}</td><td>{{tx['user_id']}}</td><td>{{tx['type']}}</td>
-        <td>${{ "%.2f"|format(tx['amount']) }} {{currency}}</td>
-        <td>{{tx['method']}}</td>
-        <td>{% if tx['proof_file'] %}<a href="/kyc/{{tx['proof_file']}}">Download</a>{% else %}-{% endif %}</td>
-        <td>{{tx['timestamp']}}</td><td>{{tx['status']}}</td>
-        <td>
-          {% if tx['status']=="Pending" %}
-            <a href="/admin/approve/{{tx['id']}}">Approve</a> |
-            <a href="/admin/reject_form/{{tx['id']}}">Reject</a>
-          {% else %}
-            -
-          {% endif %}
-        </td>
-      </tr>
-    {% endfor %}
-    </table>
-
-    <h2>Registered Users</h2>
-    <table>
-      <tr><th>User ID</th><th>Name</th><th>Email</th><th>KYC</th><th>KYC File</th><th>Balance</th><th>Adjust</th></tr>
-      {% for uid,info in users.items() %}
-      <tr>
-        <td>{{uid}}</td>
-        <td>{{info.get('name') or '-'}}</td>
-        <td>{{info.get('email') or '-'}}</td>
-        <td>{% if info.get('kyc_uploaded') %}✅{% else %}❌{% endif %}</td>
-        <td>{% if info.get('kyc_file') %}<a href="/kyc/{{info.get('kyc_file')}}">Download</a>{% else %}-{% endif %}</td>
-        <td>${{ "%.2f"|format(info.get('balance',0.0)) }} {{currency}}</td>
-        <td><a href="/admin/adjust_balance/{{uid}}">Adjust</a></td>
-      </tr>
-      {% endfor %}
-    </table>
-
-    <h2>Recent Audit Example</h2>
-    <pre>{{ txs[0] if txs else "No transactions yet." }}</pre>
-
-    </body></html>
-    """
-    return render_template_string(html, txs=txs_sorted, users=users, admin_user=session.get("admin_user"), currency=CURRENCY)
-
-# Approve endpoint: credits/debits and records admin user
-@app.route("/admin/approve/<int:tx_id>")
-@login_required
-def admin_approve(tx_id):
-    admin_user = session.get("admin_user", "web")
-    txs = load_txs()
-    users = load_users()
-    for tx in txs:
-        if tx["id"] == tx_id and tx["status"] == "Pending":
-            uid = tx["user_id"]
-            amount = float(tx["amount"])
-            # ensure user record exists
-            if uid not in users:
-                users[uid] = {"name": None, "email": None, "kyc_uploaded": False, "kyc_file": "", "balance": 0.0}
-            if tx["type"] == "Deposit":
-                users[uid]["balance"] = float(users[uid].get("balance", 0.0)) + amount
-                tx["status"] = "Approved"
-                tx["admin_comment"] = f"Approved by {admin_user} at {now_str()}"
-                append_audit_entry(tx, admin_user, "Approve Deposit", reason=f"Credited {amount} {CURRENCY}")
-            elif tx["type"] == "Withdrawal":
-                if users[uid].get("balance",0.0) >= amount:
-                    users[uid]["balance"] = float(users[uid].get("balance", 0.0)) - amount
-                    tx["status"] = "Approved"
-                    tx["admin_comment"] = f"Approved by {admin_user} at {now_str()}"
-                    append_audit_entry(tx, admin_user, "Approve Withdrawal", reason=f"Debited {amount} {CURRENCY}")
-                else:
-                    # insufficient funds -> reject automatically
-                    tx["status"] = "Rejected"
-                    reason = "Insufficient balance to approve withdrawal"
-                    tx["admin_comment"] = f"Auto-Rejected by {admin_user} at {now_str()}: {reason}"
-                    append_audit_entry(tx, admin_user, "Auto-Reject Withdrawal", reason=reason)
-                    save_txs(txs); save_users(users)
-                    try:
-                        bot.send_message(int(uid), f"❌ Withdrawal #{tx_id} cannot be approved due to insufficient balance.")
-                    except:
-                        pass
-                    return redirect(url_for("admin_panel"))
-            else:
-                tx["status"] = "Approved"
-                append_audit_entry(tx, admin_user, "Approve", reason="")
-            save_txs(txs)
-            save_users(users)
-            # notify user
-            try:
-                bot.send_message(int(uid), f"✅ Your {tx['type']} request (id: {tx_id}) has been APPROVED. New balance: ${users[uid]['balance']:.2f} {CURRENCY}")
-            except:
-                pass
-            break
-    return redirect(url_for("admin_panel"))
-
-# Reject form & processing
-@app.route("/admin/reject_form/<int:tx_id>", methods=["GET", "POST"])
-@login_required
-def admin_reject_form(tx_id):
-    admin_user = session.get("admin_user", "web")
-    txs = load_txs()
-    tx = next((t for t in txs if t["id"] == tx_id), None)
-    if not tx:
-        return "Transaction not found", 404
-    if request.method == "POST":
-        reason = request.form.get("reason", "").strip()
-        if not reason:
-            return "<h3>Reason required</h3><a href='/admin'>Back</a>"
-        tx["status"] = "Rejected"
-        tx["admin_comment"] = f"Rejected by {admin_user} at {now_str()}: {reason}"
-        append_audit_entry(tx, admin_user, "Reject", reason=reason)
-        save_txs(txs)
-        # notify user
-        try:
-            bot.send_message(int(tx["user_id"]), f"❌ Your {tx['type']} request (id: {tx_id}) was rejected. Reason: {reason}")
-        except:
-            pass
-        return redirect(url_for("admin_panel"))
-    # GET: show simple form
-    return render_template_string("""
-      <h3>Reject Transaction #{{tx_id}}</h3>
-      <form method="post">
-        <label>Reason (required):</label><br>
-        <textarea name="reason" rows="4" cols="60" required></textarea><br><br>
-        <input type="submit" value="Submit rejection"> &nbsp; <a href="/admin">Cancel</a>
-      </form>
-    """, tx_id=tx_id)
-
-# Manual balance adjust
-@app.route("/admin/adjust_balance/<user_id>", methods=["GET", "POST"])
-@login_required
-def admin_adjust_balance(user_id):
-    admin_user = session.get("admin_user", "web")
-    users = load_users()
-    if user_id not in users:
-        return "User not found", 404
-    if request.method == "POST":
-        try:
-            amt = float(request.form.get("amount"))
-        except:
-            return "<h3>Invalid amount</h3><a href='/admin'>Back</a>"
-        action = request.form.get("action")
-        reason = request.form.get("reason","").strip()
-        if action not in ["credit","debit"]:
-            return "<h3>Invalid action</h3><a href='/admin'>Back</a>"
-        if action == "credit":
-            users[user_id]["balance"] = float(users[user_id].get("balance",0.0)) + amt
-            audit_reason = f"Manual credit {amt} by {admin_user}. {reason}"
-        else:
-            users[user_id]["balance"] = float(users[user_id].get("balance",0.0)) - amt
-            audit_reason = f"Manual debit {amt} by {admin_user}. {reason}"
-        save_users(users)
-        # create audit transaction for traceability
-        txs = load_txs()
-        tx_id = (txs[-1]["id"]+1) if txs else 1
-        tx = {
-            "id": tx_id,
-            "user_id": user_id,
-            "type": "ManualAdjust",
-            "amount": amt,
-            "method": "Admin",
-            "proof_file": "",
-            "status": "Completed",
-            "timestamp": now_str(),
-            "admin_comment": audit_reason,
-            "audit": [{"admin": admin_user, "action": "ManualAdjust", "reason": audit_reason, "timestamp": now_str()}]
-        }
-        txs.append(tx)
-        save_txs(txs)
-        return redirect(url_for("admin_panel"))
-    # GET: show form
-    return render_template_string("""
-      <h3>Adjust Balance for user {{uid}}</h3>
-      <form method="post">
-        <select name="action">
-          <option value="credit">Credit</option>
-          <option value="debit">Debit</option>
-        </select><br><br>
-        <input name="amount" placeholder="Amount (numbers only)"><br><br>
-        <textarea name="reason" placeholder="Reason (optional)"></textarea><br><br>
-        <input type="submit" value="Submit">
-      </form>
-      <p><a href="/admin">Back</a></p>
-    """, uid=user_id)
-
-# Serve stored files (KYC or proofs) — admin-only
-@app.route("/kyc/<path:filename>")
-@login_required
-def serve_file(filename):
-    return send_from_directory(UPLOAD_DIR, filename, as_attachment=True)
-
-# Home / webhook setup
-@app.route(f"/{TOKEN}", methods=["POST"])
-def telegram_webhook():
-    json_str = request.get_data(as_text=True)
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
-
-@app.route("/")
+# ---------------- Flask keepalive ----------------
+@app.route('/')
 def home():
-    return "AitoCap bot is running."
+    return "✅ ProfitPlus bot is live with admin panel."
 
-# ----------------- STARTUP: set webhook if on Render and run app -----------------
-if __name__ == "__main__":
-    # If Render exposes RENDER_EXTERNAL_URL (it does), use it to set webhook
-    external = os.environ.get("RENDER_EXTERNAL_URL")
-    if external:
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# ---------------- Bot commands (user) ----------------
+
+@bot.message_handler(commands=['start'])
+def cmd_start(msg):
+    get_user_record(msg.chat.id)
+    text = (
+        "👋 *Welcome to ProfitPlus!* \n\n"
+        "Commands:\n"
+        "/deposit - Show deposit addresses and request deposit\n"
+        "/balance - View your balance\n"
+        "/withdraw - Request withdrawal\n"
+        "/help - Show help\n"
+        "/admin - Admin login (admin only)\n\n"
+        "To notify us that you've sent a deposit, either use /request_deposit or type \"I've paid\" and follow prompts."
+    )
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['help'])
+def cmd_help(msg):
+    text = (
+        "📖 *Help*\n\n"
+        "/deposit - show deposit wallets\n"
+        "/request_deposit - record a deposit for admin review\n"
+        "/balance - view balance\n"
+        "/withdraw - request a withdrawal\n"
+    )
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['deposit'])
+def cmd_deposit(msg):
+    lines = ["💳 *Deposit Addresses:*"]
+    for k, v in WALLETS.items():
+        lines.append(f"{k}: `{v}`")
+    lines.append("\nAfter sending funds, run /request_deposit to tell us (or type \"I've paid\"). Admin will review and approve manually.")
+    bot.send_message(msg.chat.id, "\n".join(lines), parse_mode="Markdown")
+
+# request_deposit flow (starts when user runs command)
+@bot.message_handler(commands=['request_deposit'])
+def cmd_request_deposit(msg):
+    bot.send_message(msg.chat.id, "🔔 Enter deposit details in the format:\nCOIN AMOUNT [TXID]\nExample: BTC 50 abc123txid (TXID optional)")
+    bot.register_next_step_handler(msg, handle_request_deposit)
+
+def handle_request_deposit(msg):
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "❌ Invalid format. Use: COIN AMOUNT [TXID]")
+        return
+    coin = parts[0].upper()
+    try:
+        amount = float(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "❌ Invalid amount. Use numbers, e.g., 50")
+        return
+    txid = parts[2] if len(parts) >= 3 else ""
+    did = add_deposit_request(msg.chat.id, coin, amount, txid)
+    bot.send_message(msg.chat.id, f"✅ Deposit request created (ID: {did}). Admin will review and confirm soon.")
+    # notify admin
+    bot.send_message(ADMIN_ID, f"🔔 New deposit request #{did}\nUser: {msg.chat.id}\nCoin: {coin}\nAmount: {format_money(amount)}\nTXID: {txid}\nApprove with /approve_deposit {did} or view pending with /pending_deposits")
+
+# accept "I've paid" or variants -> start deposit step
+@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in ["i've paid", "ive paid", "i have paid"])
+def ive_paid_handler(msg):
+    bot.send_message(msg.chat.id, "Great — enter deposit details now in format: COIN AMOUNT [TXID]\nExample: BTC 50 abc123")
+    bot.register_next_step_handler(msg, handle_request_deposit)
+
+@bot.message_handler(commands=['balance'])
+def cmd_balance(msg):
+    rec = get_user_record(msg.chat.id)
+    bot.send_message(msg.chat.id, f"💼 Your balance: {format_money(rec['balance'])}")
+
+# ---------------- Withdraw flow (user) ----------------
+@bot.message_handler(commands=['withdraw'])
+def cmd_withdraw(msg):
+    bot.send_message(msg.chat.id, "💵 Enter withdrawal request: COIN AMOUNT\nExample: USDT-TRC20 10")
+    bot.register_next_step_handler(msg, handle_withdraw_amount)
+
+def handle_withdraw_amount(msg):
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "❌ Invalid format. Use: COIN AMOUNT")
+        return
+    coin = parts[0].upper()
+    try:
+        amount = float(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "❌ Invalid amount.")
+        return
+    rec = get_user_record(msg.chat.id)
+    if amount > rec['balance']:
+        bot.send_message(msg.chat.id, f"❌ Insufficient balance ({format_money(rec['balance'])}).")
+        return
+    bot.send_message(msg.chat.id, "🏦 Enter destination wallet address for withdrawal:")
+    bot.register_next_step_handler(msg, handle_withdraw_wallet, coin, amount)
+
+def handle_withdraw_wallet(msg, coin, amount):
+    wallet = msg.text.strip()
+    wid = add_withdraw_request(msg.chat.id, coin, amount, wallet)
+    bot.send_message(msg.chat.id, f"✅ Withdrawal request created (ID: {wid}). Admin will review and confirm.")
+    bot.send_message(ADMIN_ID, f"🔔 New withdrawal #{wid}\nUser: {msg.chat.id}\nCoin: {coin}\nAmount: {format_money(amount)}\nWallet: {wallet}\nApprove with /approve_withdraw {wid}")
+
+# ---------------- Admin: login + panel ----------------
+admin_sessions = {}  # chat_id -> True
+
+@bot.message_handler(commands=['admin'])
+def cmd_admin(msg):
+    if msg.chat.id != ADMIN_ID:
+        bot.send_message(msg.chat.id, "🚫 You are not authorized to use admin.")
+        return
+    bot.send_message(msg.chat.id, "🔐 Enter admin password:")
+    bot.register_next_step_handler(msg, verify_admin)
+
+def verify_admin(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    if msg.text == ADMIN_PASSWORD:
+        admin_sessions[msg.chat.id] = True
+        # show inline admin menu
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("✅ Approve Deposits", callback_data="admin_approve_deposits"))
+        markup.add(telebot.types.InlineKeyboardButton("📝 Withdraw Requests", callback_data="admin_withdrawals"))
+        markup.add(telebot.types.InlineKeyboardButton("👥 View Users", callback_data="admin_view_users"))
+        markup.add(telebot.types.InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"))
+        markup.add(telebot.types.InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"))
+        bot.send_message(msg.chat.id, "🔑 Admin logged in. Choose an option:", reply_markup=markup)
+    else:
+        bot.send_message(msg.chat.id, "❌ Incorrect password.")
+
+@bot.message_handler(commands=['logout'])
+def cmd_logout(msg):
+    admin_sessions.pop(msg.chat.id, None)
+    bot.send_message(msg.chat.id, "👋 Logged out of admin mode.")
+
+# ---------------- Admin commands for quick usage ----------------
+@bot.message_handler(commands=['pending_deposits'])
+def cmd_pending_deposits(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    pend = deposits_table.search(Query().status == 'pending')
+    if not pend:
+        bot.send_message(msg.chat.id, "No pending deposits.")
+        return
+    text_lines = ["🔎 Pending deposits:"]
+    for d in pend:
+        text_lines.append(f"ID:{d['id']} User:{d['user_id']} {d['coin']} {format_money(d['amount'])} TXID:{d.get('txid','')}")
+    bot.send_message(msg.chat.id, "\n".join(text_lines))
+
+@bot.message_handler(commands=['pending_withdrawals'])
+def cmd_pending_withdrawals(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    pend = withdrawals_table.search(Query().status == 'pending')
+    if not pend:
+        bot.send_message(msg.chat.id, "No pending withdrawals.")
+        return
+    text_lines = ["🔎 Pending withdrawals:"]
+    for w in pend:
+        text_lines.append(f"ID:{w['id']} User:{w['user_id']} {w['coin']} {format_money(w['amount'])} -> {w['wallet']}")
+    bot.send_message(msg.chat.id, "\n".join(text_lines))
+
+@bot.message_handler(commands=['approve_deposit'])
+def cmd_approve_deposit(msg):
+    if msg.chat.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) != 2:
+        bot.send_message(msg.chat.id, "Usage: /approve_deposit <deposit_id>")
+        return
+    try:
+        did = int(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "Invalid deposit id.")
+        return
+    rec = deposits_table.get(Query().id == did)
+    if not rec or rec.get('status') != 'pending':
+        bot.send_message(msg.chat.id, "Deposit not found or already processed.")
+        return
+    # credit user
+    uid = rec['user_id']
+    amt = rec['amount']
+    user_rec = get_user_record(uid)
+    new_bal = user_rec['balance'] + amt
+    update_balance(uid, new_bal)
+    deposits_table.update({'status': 'approved'}, Query().id == did)
+    bot.send_message(msg.chat.id, f"✅ Deposit #{did} approved. User {uid} credited {format_money(amt)}.")
+    bot.send_message(uid, f"💰 Your deposit (ID: {did}) of {format_money(amt)} has been *approved* by admin. New balance: {format_money(new_bal)}", parse_mode="Markdown")
+
+@bot.message_handler(commands=['reject_deposit'])
+def cmd_reject_deposit(msg):
+    if msg.chat.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "Usage: /reject_deposit <deposit_id> [reason]")
+        return
+    try:
+        did = int(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "Invalid deposit id.")
+        return
+    rec = deposits_table.get(Query().id == did)
+    if not rec or rec.get('status') != 'pending':
+        bot.send_message(msg.chat.id, "Deposit not found or already processed.")
+        return
+    deposits_table.update({'status': 'rejected'}, Query().id == did)
+    uid = rec['user_id']
+    bot.send_message(msg.chat.id, f"❌ Deposit #{did} rejected.")
+    bot.send_message(uid, f"❌ Your deposit (ID: {did}) has been rejected by admin. Please contact support.")
+
+@bot.message_handler(commands=['approve_withdraw'])
+def cmd_approve_withdraw(msg):
+    if msg.chat.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) != 2:
+        bot.send_message(msg.chat.id, "Usage: /approve_withdraw <withdraw_id>")
+        return
+    try:
+        wid = int(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "Invalid withdraw id.")
+        return
+    rec = withdrawals_table.get(Query().id == wid)
+    if not rec or rec.get('status') != 'pending':
+        bot.send_message(msg.chat.id, "Withdraw not found or already processed.")
+        return
+    uid = rec['user_id']
+    amt = rec['amount']
+    # verify user has enough (should be validated previously, but double-check)
+    user_rec = get_user_record(uid)
+    if user_rec['balance'] < amt:
+        bot.send_message(msg.chat.id, f"❌ User {uid} has insufficient balance.")
+        withdrawals_table.update({'status': 'rejected'}, Query().id == wid)
+        bot.send_message(uid, "❌ Your withdrawal was rejected due to insufficient balance.")
+        return
+    # deduct and mark approved
+    new_bal = user_rec['balance'] - amt
+    update_balance(uid, new_bal)
+    withdrawals_table.update({'status': 'approved'}, Query().id == wid)
+    bot.send_message(msg.chat.id, f"✅ Withdrawal #{wid} approved. User {uid} debited {format_money(amt)}.")
+    bot.send_message(uid, f"💸 Your withdrawal (ID: {wid}) of {format_money(amt)} has been approved by admin. New balance: {format_money(new_bal)}")
+
+@bot.message_handler(commands=['reject_withdraw'])
+def cmd_reject_withdraw(msg):
+    if msg.chat.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "Usage: /reject_withdraw <withdraw_id> [reason]")
+        return
+    try:
+        wid = int(parts[1])
+    except:
+        bot.send_message(msg.chat.id, "Invalid withdraw id.")
+        return
+    rec = withdrawals_table.get(Query().id == wid)
+    if not rec or rec.get('status') != 'pending':
+        bot.send_message(msg.chat.id, "Withdraw not found or already processed.")
+        return
+    withdrawals_table.update({'status': 'rejected'}, Query().id == wid)
+    uid = rec['user_id']
+    bot.send_message(msg.chat.id, f"❌ Withdrawal #{wid} rejected.")
+    bot.send_message(uid, f"❌ Your withdrawal (ID: {wid}) has been rejected by admin. Contact support for details.")
+
+# broadcast (admin)
+@bot.message_handler(commands=['broadcast'])
+def cmd_broadcast(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    # next step will be the message text
+    bot.send_message(msg.chat.id, "Enter the message to broadcast to ALL users:")
+    bot.register_next_step_handler(msg, handle_broadcast)
+
+def handle_broadcast(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    text = msg.text
+    users = list_users()
+    sent = 0
+    for u in users:
         try:
-            bot.remove_webhook()
+            bot.send_message(u['id'], f"📢 Announcement:\n\n{text}")
+            sent += 1
         except:
             pass
-        try:
-            bot.set_webhook(url=f"https://{external}/{TOKEN}")
-            print("Webhook set:", f"https://{external}/{TOKEN}")
-        except Exception as e:
-            print("Error setting webhook:", e)
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    bot.send_message(msg.chat.id, f"✅ Broadcast sent to {sent} users.")
+
+# view users (admin)
+@bot.message_handler(commands=['users'])
+def cmd_users(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    users = list_users()
+    if not users:
+        bot.send_message(msg.chat.id, "No registered users.")
+        return
+    lines = ["👥 Registered users:"]
+    for u in users:
+        lines.append(f"ID: {u['id']} — Balance: {format_money(u['balance'])}")
+    bot.send_message(msg.chat.id, "\n".join(lines))
+
+# ---------------- Inline admin callbacks ----------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
+def admin_callbacks(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Unauthorized")
+        return
+
+    key = call.data.split("_", 1)[1]
+
+    if key == "approve_deposits":
+        pend = deposits_table.search(Query().status == 'pending')
+        if not pend:
+            bot.edit_message_text("No pending deposits.", call.message.chat.id, call.message.message_id)
+            return
+        # show first 5 pending with inline approve/reject buttons
+        for d in pend[:8]:
+            text = f"Deposit ID:{d['id']}\nUser:{d['user_id']}\nCoin:{d['coin']} Amount:{format_money(d['amount'])}\nTXID:{d.get('txid','')}\nStatus:{d['status']}"
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton("Approve", callback_data=f"approve_dep:{d['id']}"),
+                       telebot.types.InlineKeyboardButton("Reject", callback_data=f"reject_dep:{d['id']}"))
+            bot.send_message(call.message.chat.id, text, reply_markup=markup)
+        bot.answer_callback_query(call.id, "Showing pending deposits...")
+
+    elif key == "withdrawals":
+        pend = withdrawals_table.search(Query().status == 'pending')
+        if not pend:
+            bot.edit_message_text("No pending withdrawals.", call.message.chat.id, call.message.message_id)
+            return
+        for w in pend[:8]:
+            text = f"Withdraw ID:{w['id']}\nUser:{w['user_id']}\nCoin:{w['coin']} Amount:{format_money(w['amount'])}\nWallet:{w['wallet']}\nStatus:{w['status']}"
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton("Approve", callback_data=f"approve_wd:{w['id']}"),
+                       telebot.types.InlineKeyboardButton("Reject", callback_data=f"reject_wd:{w['id']}"))
+            bot.send_message(call.message.chat.id, text, reply_markup=markup)
+        bot.answer_callback_query(call.id, "Showing pending withdrawals...")
+
+    elif key == "view_users":
+        users = list_users()
+        if not users:
+            bot.edit_message_text("No users yet.", call.message.chat.id, call.message.message_id)
+            return
+        text = "👥 Users:\n"
+        for u in users[:50]:
+            text += f"ID:{u['id']} Bal:{format_money(u['balance'])}\n"
+        bot.send_message(call.message.chat.id, text)
+        bot.answer_callback_query(call.id, "Users listed.")
+
+    elif key == "broadcast":
+        bot.send_message(call.message.chat.id, "Enter broadcast message (use /broadcast command):")
+        bot.answer_callback_query(call.id, "Use /broadcast to send message.")
+
+    elif key == "settings":
+        # show wallets and simple info
+        text = "⚙️ Settings\nWallets:"
+        for k, v in WALLETS.items():
+            text += f"\n{k}: {v}"
+        bot.send_message(call.message.chat.id, text)
+        bot.answer_callback_query(call.id, "Settings shown.")
+
+# action callbacks approve/reject deposit & withdraw
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_dep:") or call.data.startswith("reject_dep:") or call.data.startswith("approve_wd:") or call.data.startswith("reject_wd:"))
+def action_callbacks(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Unauthorized")
+        return
+    data = call.data
+    if data.startswith("approve_dep:"):
+        did = int(data.split(":",1)[1])
+        rec = deposits_table.get(Query().id == did)
+        if not rec or rec.get('status') != 'pending':
+            bot.answer_callback_query(call.id, "Not found/already processed")
+            return
+        uid = rec['user_id']; amt = rec['amount']
+        # credit user
+        user_rec = get_user_record(uid)
+        new_bal = user_rec['balance'] + amt
+        update_balance(uid, new_bal)
+        deposits_table.update({'status':'approved'}, Query().id == did)
+        bot.send_message(call.message.chat.id, f"✅ Deposit #{did} approved.")
+        bot.send_message(uid, f"💰 Your deposit (ID: {did}) of {format_money(amt)} was approved. New balance: {format_money(new_bal)}")
+        bot.answer_callback_query(call.id, "Deposit approved")
+    elif data.startswith("reject_dep:"):
+        did = int(data.split(":",1)[1])
+        rec = deposits_table.get(Query().id == did)
+        if not rec or rec.get('status') != 'pending':
+            bot.answer_callback_query(call.id, "Not found/already processed")
+            return
+        deposits_table.update({'status':'rejected'}, Query().id == did)
+        uid = rec['user_id']
+        bot.send_message(call.message.chat.id, f"❌ Deposit #{did} rejected.")
+        bot.send_message(uid, f"❌ Your deposit (ID: {did}) was rejected by admin.")
+        bot.answer_callback_query(call.id, "Deposit rejected")
+    elif data.startswith("approve_wd:"):
+        wid = int(data.split(":",1)[1])
+        rec = withdrawals_table.get(Query().id == wid)
+        if not rec or rec.get('status') != 'pending':
+            bot.answer_callback_query(call.id, "Not found/already processed")
+            return
+        uid = rec['user_id']; amt = rec['amount']
+        user_rec = get_user_record(uid)
+        if user_rec['balance'] < amt:
+            withdrawals_table.update({'status':'rejected'}, Query().id == wid)
+            bot.send_message(call.message.chat.id, f"❌ User {uid} has insufficient balance. Withdrawal rejected.")
+            bot.send_message(uid, f"❌ Your withdrawal (ID: {wid}) was rejected due to insufficient balance.")
+            bot.answer_callback_query(call.id, "Insufficient funds")
+            return
+        new_bal = user_rec['balance'] - amt
+        update_balance(uid, new_bal)
+        withdrawals_table.update({'status':'approved'}, Query().id == wid)
+        bot.send_message(call.message.chat.id, f"✅ Withdrawal #{wid} approved.")
+        bot.send_message(uid, f"💸 Your withdrawal (ID: {wid}) of {format_money(amt)} has been approved. New balance: {format_money(new_bal)}")
+        bot.answer_callback_query(call.id, "Withdrawal approved")
+    elif data.startswith("reject_wd:"):
+        wid = int(data.split(":",1)[1])
+        rec = withdrawals_table.get(Query().id == wid)
+        if not rec or rec.get('status') != 'pending':
+            bot.answer_callback_query(call.id, "Not found/already processed")
+            return
+        withdrawals_table.update({'status':'rejected'}, Query().id == wid)
+        uid = rec['user_id']
+        bot.send_message(call.message.chat.id, f"❌ Withdrawal #{wid} rejected.")
+        bot.send_message(uid, f"❌ Your withdrawal (ID: {wid}) was rejected by admin.")
+        bot.answer_callback_query(call.id, "Withdrawal rejected")
+
+# ---------------- Safety / startup ----------------
+def run_bot():
+    print("🤖 ProfitPlus bot starting (polling)...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
+if __name__ == "__main__":
+    # Start Flask and bot threads
+    threading.Thread(target=run_flask).start()
+    run_bot()
